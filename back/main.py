@@ -2,9 +2,23 @@ from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 import pandas as pd
 import os
+import io
+from fastapi.middleware.cors import CORSMiddleware
+from train_model import train_and_evaluate
+from pydantic import BaseModel
+from typing import List
 
 # Создаем экземпляр приложения
 app = FastAPI()
+
+# Настройка CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # Разрешаем запросы с вашего фронтенда
+    allow_credentials=True,
+    allow_methods=["*"],  # Разрешаем все методы (GET, POST, и т.д.)
+    allow_headers=["*"],  # Разрешаем все заголовки
+)
 
 # Папка для хранения файлов
 PROCESSED_DIR = "./processed"
@@ -14,33 +28,48 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 # Эндпоинт для загрузки и обработки датасета
 @app.post("/upload-and-process/")
 async def upload_and_process(file: UploadFile):
-    # Проверка типа файла
-    if not file.filename.endswith('.xlsx'):
-        raise HTTPException(status_code=400, detail="Only .xlsx files are supported.")
+    contents = await file.read()
+    file_like = io.BytesIO(contents)
 
-    try:
-        # Чтение содержимого файла в Pandas DataFrame
-        df = pd.read_excel(file.file)
+    df = pd.read_excel(file_like)
 
-        # Удаление client_id
-        if "client_id" in df.columns:
-            df = df.drop(columns=["client_id"])
+    if "client_id" in df.columns:
+        df = df.drop(columns=["client_id"])
+    df_clean = df.dropna()
+    df_encoded = pd.get_dummies(df_clean, drop_first=True)
+    X_train = df_encoded.astype('float32')
 
-        # Удаление пропусков
-        df_clean = df.dropna()
+    # Сохранение обработанного файла
+    processed_file_name = "processed_dataset.xlsx"
+    processed_file_path = os.path.join(PROCESSED_DIR, processed_file_name)
+    X_train.to_excel(processed_file_path, index=False)
 
-        # Кодирование категориальных переменных
-        df_encoded = pd.get_dummies(df_clean, drop_first=True)
+    return {
+        "message": "Файл успешно загружен и обработан."
+    }
 
-        # Сохранение обработанного файла
-        processed_file_name = f"processed_{file.filename}"
-        processed_file_path = os.path.join(PROCESSED_DIR, processed_file_name)
-        df_encoded.to_excel(processed_file_path, index=False)
+class ExperimentParams(BaseModel):
+    architecture: str  # Архитектура модели
+    latentDim: int  # Размер латентного пространства
+    epoch: int  # Количество эпох
+    batchSize: int  # Размер батча
+    learningRate: float # Скорость обучения
+    activation: str  # Функция активации
 
-        return {
-            "message": "File uploaded and processed successfully.",
-            "processed_file_path": processed_file_path,
-        }
+class ExperimentResult(BaseModel):
+    silhouette: float
+    davies_bouldin: float
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred during processing: {str(e)}")
+# Эндпоинт для запуска эксперимента
+@app.post("/experiment/", response_model=ExperimentResult)
+async def run_experiment(params: ExperimentParams):
+    silhouette, davies_bouldin = train_and_evaluate(
+        architecture=params.architecture,
+        latent_dim=params.latentDim,
+        epochs=params.epoch,
+        batch_size=params.batchSize,
+        learning_rate=params.learningRate,
+        activation=params.activation
+    )
+    
+    return ExperimentResult(silhouette=silhouette, davies_bouldin=davies_bouldin)
